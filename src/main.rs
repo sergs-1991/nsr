@@ -1,10 +1,10 @@
-use std::{fs, mem};
+use std::{io::Read, io::Write, fs, mem, net::Ipv4Addr};
 use std::os::fd::AsRawFd;
+
 use nix::ioctl_write_int;
-use std::io::Read;
 use cty;
 use mac_address::MacAddress;
-
+use byte::{BE, BytesExt, /*ctx::Endian, TryRead, TryWrite*/};
 
 const DEVICE_NAME: &str = "tap0";
 
@@ -49,6 +49,29 @@ impl Ifreq {
 
     // TODO: implement a Display trait 
 }
+/*
+struct EthernetFrame<'a> {
+    mac_dest: MacAddress,
+    mac_src: MacAddress,
+    ether_type: u16 //TODO: add enum type
+}
+
+impl<'a> TryRead<'a, Endian> for  EthernetFrame<'a> {
+    fn try_read(bytes: &'a [u8], endian: Endian) -> Result<(Self, usize)> {
+        let mac_dest = MacAddress::new(bytes[0..6].try_into().unwrap());
+        let mac_src = MacAddress::new(bytes[6..12].try_into().unwrap());
+
+        let ether_type = u16::from_be_bytes(bytes[12..14].try_into().unwrap());
+        let frame = EthernetFrame{
+            mac_dest: MacAddress::new(bytes[0..6].try_into().unwrap()),
+            mac_src: MacAddress::new(bytes[6..12].try_into().unwrap()),
+            ether_type: u16::from_be_bytes(bytes[12..14].try_into().unwrap())
+        };
+
+        Ok((frame, 14))
+    }
+}
+*/
 
 struct TapInterface {
     interface: fs::File
@@ -89,13 +112,33 @@ impl TapInterface {
                     continue;
                 }
             };
-            println!("size of ethernet frame: {size}");
+            println!("size of ethernet frame: {size} bytes");
 
-            Self::parse_eth_frame(&ethernet_frame);
+            self.parse_eth_frame(&ethernet_frame);
         }
     }
 
-    fn parse_eth_frame(frame: &[u8]) {
+    pub fn send_eth_frame(&mut self, frame: &mut [u8]) {
+        let mac_dst = MacAddress::new([0x42, 0xd1, 0xbc, 0x59, 0x14, 0x8e]);
+        let mac_src = MacAddress::new([0x44, 0x43, 0x42, 0x41, 0x40, 0x39]);
+        let ether_type: u16 = 0x0806;
+
+        let offset = &mut 0;
+        frame.write_with::<&[u8]>(offset, &mac_dst.bytes(), ()).unwrap();
+        frame.write_with::<&[u8]>(offset, &mac_src.bytes(), ()).unwrap();
+        frame.write_with::<u16>(offset, ether_type, BE).unwrap();
+
+        match self.interface.write(&frame) {
+            Ok(size) => {
+                println!("wrote {size} bytes to tap interface")
+            }
+            Err(err) => {
+                println!("failed to write to tap interface, reason: {err}")
+            }
+        }
+    }
+
+    fn parse_eth_frame(&mut self, frame: &[u8]) {
         let mac_dest = MacAddress::new(frame[0..6].try_into().unwrap());
         let mac_src = MacAddress::new(frame[6..12].try_into().unwrap());
 
@@ -104,7 +147,54 @@ impl TapInterface {
         println!("mac destination: {mac_dest}");
         println!("mac source: {mac_src}");
         println!("ethertype: 0x{:x}", ether_type);
+
+        if ether_type == 0x0806 {
+            self.parse_arp_frame(&frame[14..]);
+        }
+
         println!("");
+    }
+
+    fn parse_arp_frame(&mut self, frame: &[u8]) {
+        let htype = u16::from_be_bytes(frame[0..2].try_into().unwrap());
+        let ptype = u16::from_be_bytes(frame[2..4].try_into().unwrap());
+        let hlen = frame[4];
+        let plen = frame[5];
+        let oper = u16::from_be_bytes(frame[6..8].try_into().unwrap());
+        let sha = MacAddress::new(frame[8..14].try_into().unwrap());
+        let spa = Ipv4Addr::from(u32::from_be_bytes(frame[14..18].try_into().unwrap()));
+        let tha = MacAddress::new(frame[18..24].try_into().unwrap());
+        let tpa = Ipv4Addr::from(u32::from_be_bytes(frame[24..28].try_into().unwrap()));
+
+        println!("\nARP request:");
+        println!("htype: 0x{:x}", htype);
+        println!("ptype: 0x{:x}", ptype);
+        println!("hlen: 0x{:x}", hlen);
+        println!("plen: 0x{:x}", plen);
+        println!("oper: 0x{:x}", oper);
+        println!("sha: {sha}");
+        println!("spa: {spa}");
+        println!("tha: {tha}");
+        println!("tpa: {tpa}");
+
+        // issue an arp response 
+        let mut arp_response = [0u8; 28 + 14]; // TODO: ugly hack
+        let offset = &mut 14;
+
+        let sha_rep = MacAddress::new([0x44, 0x43, 0x42, 0x41, 0x40, 0x39]);
+        let spa_rep = Ipv4Addr::new(10, 0, 3, 1);
+
+        arp_response.write_with::<u16>(offset, htype, BE).unwrap();
+        arp_response.write_with::<u16>(offset, ptype, BE).unwrap();
+        arp_response.write_with::<u8>(offset, hlen, BE).unwrap();
+        arp_response.write_with::<u8>(offset, plen, BE).unwrap();
+        arp_response.write_with::<u16>(offset, 0x02, BE).unwrap(); // response
+        arp_response.write_with::<&[u8]>(offset, &sha_rep.bytes(), ()).unwrap();
+        arp_response.write_with::<u32>(offset, spa_rep.into(), BE).unwrap();
+        arp_response.write_with::<&[u8]>(offset, &sha.bytes(), ()).unwrap();
+        arp_response.write_with::<u32>(offset, spa.into(), BE).unwrap();
+
+        self.send_eth_frame(&mut arp_response);
     }
 }
 
