@@ -1,6 +1,7 @@
 mod nsr {
     use std::net::Ipv4Addr;
     use mac_address::MacAddress;
+    use byte::{BytesExt};
 
     const DEVICE_NAME: &str = "tap0";
     const IPADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 3, 1);
@@ -55,7 +56,7 @@ mod nsr {
     mod arp {
         use byte::{BE, BytesExt, TryRead, TryWrite, ctx::Bytes};
         use mac_address::MacAddress;
-        use std::{fmt, net::Ipv4Addr};
+        use std::{fmt, net::Ipv4Addr, collections::HashMap};
 
         pub struct ARPHeader {
             pub htype: u16,
@@ -112,6 +113,72 @@ mod nsr {
                 write!(f, "arp header:\n\thtype: 0x{:x}\n\tptype: 0x{:x}\n\thlen: 0x{:x}\n\t\
                 plen: 0x{:x}\n\toper: 0x{:x}\n\tsha: {}\n\tspa: {}\n\ttha: {}\n\ttpa: {}",
                 self.htype, self.ptype, self.hlen, self.plen, self.oper, self.sha, self.spa, self.tha, self.tpa)
+            }
+        }
+
+        impl Default for ARPHeader {
+            fn default() -> Self {
+                ARPHeader {
+                    htype: 0x01,
+                    ptype: 0x0800,
+                    hlen: 0x06,
+                    plen: 0x04,
+                    oper: 0x01,
+                    sha: MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+                    spa: Ipv4Addr::new(0, 0, 0, 0),
+                    tha: MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+                    tpa: Ipv4Addr::new(0, 0, 0, 0)
+                }
+            }
+        }
+
+        impl ARPHeader{
+            pub fn request() -> Self {
+                ARPHeader { ..Default::default() }                    
+            }
+
+            #[allow(dead_code)]
+            pub fn reply() -> Self {
+                ARPHeader { oper: 0x02, ..Default::default() }                    
+            }
+
+            pub fn is_probe(&self) -> bool {
+                self.spa == Ipv4Addr::new(0, 0, 0, 0)
+            }
+
+            pub fn is_request(&self) -> bool {
+                self.oper == 1
+            }
+
+            pub fn is_announcement(&self) -> bool {
+                self.spa == self.tpa
+            }
+        }
+
+        pub struct ARPCacher {
+            cache: HashMap<Ipv4Addr, MacAddress>
+        }
+    
+        impl ARPCacher {
+            pub fn new() -> Self {
+                ARPCacher {
+                    cache: HashMap::new()
+                }
+            }
+    
+            pub fn update(&mut self, ip4: Ipv4Addr, mac: MacAddress) {
+                self.cache.insert(ip4, mac);
+            }
+    
+            #[allow(dead_code)]
+            pub fn get_mac_addr(&self, ip4: &Ipv4Addr) -> Option<MacAddress> {
+                self.cache.get(ip4).copied()
+            }
+        }
+    
+        impl fmt::Display for ARPCacher {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "arp cache: {:?}", self.cache)
             }
         }
     }
@@ -209,7 +276,7 @@ mod nsr {
             }
         
             pub fn write_packet(&mut self, packet: &[u8]) {  
-                match self.file.write(&packet) {
+                match self.file.write(packet) {
                     Ok(size) => {
                         println!("wrote {size} bytes to tap interface")
                     }
@@ -228,7 +295,8 @@ mod nsr {
     }
 
     pub struct Node {
-        iff: Interface
+        iff: Interface,
+        arp_cache: arp::ARPCacher
     }
 
     impl Node {
@@ -237,8 +305,9 @@ mod nsr {
                 iff: Interface {
                     ip4: IPADDR,
                     mac: MacAddress::new(MACADDR),
-                    device: tap::TapInterface::new(DEVICE_NAME)
-                }
+                    device: tap::TapInterface::new(DEVICE_NAME),
+                },
+                arp_cache: arp::ARPCacher::new()
             }
         }
 
@@ -275,30 +344,109 @@ mod nsr {
         println!("");
     }
 
-    use byte::{BE, BytesExt};
     fn parse_arp_frame(node: &mut Node, packet: &[u8]) {
         let mut arp_header: arp::ARPHeader = packet.read(&mut 0).unwrap();
         println!("{arp_header}");
 
-        // issue an arp response 
-        arp_header.tha = arp_header.sha;
-        arp_header.tpa = arp_header.spa;
+        if !arp_header.is_probe() {
+            node.arp_cache.update(arp_header.spa, arp_header.sha);
+            println!("{}", node.arp_cache);
+        }
+
+        if !arp_header.is_announcement() && arp_header.is_request() && arp_header.tpa == node.iff.ip4 {
+            // issue an arp response 
+            let eth_header = ethernet::EthernetHeader {
+                mac_dest: arp_header.sha,
+                mac_src: node.iff.mac,
+                ether_type: 0x0806
+            };
+
+            arp_header.tha = arp_header.sha;
+            arp_header.tpa = arp_header.spa;
+            arp_header.sha = node.iff.mac;
+            arp_header.spa = node.iff.ip4;
+            arp_header.oper = 0x02;
+
+            let mut arp_response = [0u8; 14 + 28];
+            let offset = &mut 0;
+            
+            arp_response.write(offset, eth_header).unwrap();
+            arp_response.write(offset, arp_header).unwrap();
+
+            node.iff.device.write_packet(&arp_response);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn issue_arp_request(node: &mut Node, ip: Ipv4Addr) {
+        let mut arp_header = arp::ARPHeader::request();
+
+        let eth_header = ethernet::EthernetHeader {
+            mac_dest: MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            mac_src: node.iff.mac,
+            ether_type: 0x0806
+        };
+
         arp_header.sha = node.iff.mac;
         arp_header.spa = node.iff.ip4;
-        arp_header.oper = 0x02;
-        
-        let mac_dst = MacAddress::new([0x42, 0xd1, 0xbc, 0x59, 0x14, 0x8e]);
-        let ether_type: u16 = 0x0806;
+        arp_header.tha = MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        arp_header.tpa = ip;
 
-        let mut arp_response = [0u8; 28 + 14]; // TODO: ugly hack
+        let mut arp_probe = [0u8; 14 + 28];
         let offset = &mut 0;
         
-        arp_response.write_with::<&[u8]>(offset, &mac_dst.bytes(), ()).unwrap();
-        arp_response.write_with::<&[u8]>(offset, &node.iff.mac.bytes(), ()).unwrap();
-        arp_response.write_with::<u16>(offset, ether_type, BE).unwrap();
-        arp_response.write(offset, arp_header).unwrap();
+        arp_probe.write(offset, eth_header).unwrap();
+        arp_probe.write(offset, arp_header).unwrap();
+
+        node.iff.device.write_packet(&arp_probe);
+    }
+
+    #[allow(dead_code)]
+    fn issue_arp_probe(node: &mut Node, ip: Ipv4Addr) {
+        let mut arp_header = arp::ARPHeader::request();
+
+        let eth_header = ethernet::EthernetHeader {
+            mac_dest: MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            mac_src: node.iff.mac,
+            ether_type: 0x0806
+        };
+
+        arp_header.sha = node.iff.mac;
+        arp_header.spa = Ipv4Addr::new(0, 0, 0, 0);
+        arp_header.tha = MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        arp_header.tpa = ip;
+
+        let mut arp_probe = [0u8; 14 + 28];
+        let offset = &mut 0;
         
-        node.iff.device.write_packet(&mut arp_response);
+        arp_probe.write(offset, eth_header).unwrap();
+        arp_probe.write(offset, arp_header).unwrap();
+
+        node.iff.device.write_packet(&arp_probe);
+    }
+
+    #[allow(dead_code)]
+    fn issue_arp_announcement(node: &mut Node) {
+        let mut arp_header = arp::ARPHeader::request();
+
+        let eth_header = ethernet::EthernetHeader {
+            mac_dest: MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            mac_src: node.iff.mac,
+            ether_type: 0x0806
+        };
+
+        arp_header.sha = node.iff.mac;
+        arp_header.spa = node.iff.ip4;
+        arp_header.tha = MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        arp_header.tpa = arp_header.spa;
+
+        let mut arp_probe = [0u8; 14 + 28];
+        let offset = &mut 0;
+        
+        arp_probe.write(offset, eth_header).unwrap();
+        arp_probe.write(offset, arp_header).unwrap();
+
+        node.iff.device.write_packet(&arp_probe); 
     }
 }
 
