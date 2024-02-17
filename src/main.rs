@@ -378,7 +378,7 @@ mod nsr {
     }
 
     #[allow(dead_code)]
-    fn issue_arp_request(node: &mut Node, ip: Ipv4Addr) {
+    pub fn issue_arp_request(node: &mut Node, ip: Ipv4Addr) {
         let mut arp_header = arp::ARPHeader::request();
 
         let eth_header = ethernet::EthernetHeader {
@@ -392,17 +392,17 @@ mod nsr {
         arp_header.tha = MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         arp_header.tpa = ip;
 
-        let mut arp_probe = [0u8; 14 + 28];
+        let mut arp_request = [0u8; 14 + 28];
         let offset = &mut 0;
         
-        arp_probe.write(offset, eth_header).unwrap();
-        arp_probe.write(offset, arp_header).unwrap();
+        arp_request.write(offset, eth_header).unwrap();
+        arp_request.write(offset, arp_header).unwrap();
 
-        node.iff.device.write_packet(&arp_probe);
+        node.iff.device.write_packet(&arp_request);
     }
 
     #[allow(dead_code)]
-    fn issue_arp_probe(node: &mut Node, ip: Ipv4Addr) {
+    pub fn issue_arp_probe(node: &mut Node, ip: Ipv4Addr) {
         let mut arp_header = arp::ARPHeader::request();
 
         let eth_header = ethernet::EthernetHeader {
@@ -426,7 +426,7 @@ mod nsr {
     }
 
     #[allow(dead_code)]
-    fn issue_arp_announcement(node: &mut Node) {
+    pub fn issue_arp_announcement(node: &mut Node) {
         let mut arp_header = arp::ARPHeader::request();
 
         let eth_header = ethernet::EthernetHeader {
@@ -440,17 +440,50 @@ mod nsr {
         arp_header.tha = MacAddress::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         arp_header.tpa = arp_header.spa;
 
-        let mut arp_probe = [0u8; 14 + 28];
+        let mut arp_announcement = [0u8; 14 + 28];
         let offset = &mut 0;
         
-        arp_probe.write(offset, eth_header).unwrap();
-        arp_probe.write(offset, arp_header).unwrap();
+        arp_announcement.write(offset, eth_header).unwrap();
+        arp_announcement.write(offset, arp_header).unwrap();
 
-        node.iff.device.write_packet(&arp_probe); 
+        node.iff.device.write_packet(&arp_announcement);
+    }
+
+    #[allow(dead_code)]
+    pub fn issue_arp_announcement_reply(node: &mut Node) {
+        let mut arp_header = arp::ARPHeader::reply();
+
+        let eth_header = ethernet::EthernetHeader {
+            mac_dest: MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            mac_src: node.iff.mac,
+            ether_type: 0x0806
+        };
+
+        arp_header.sha = node.iff.mac;
+        arp_header.spa = node.iff.ip4;
+        arp_header.tha = MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        arp_header.tpa = arp_header.spa;
+
+        let mut arp_announcement = [0u8; 14 + 28];
+        let offset = &mut 0;
+
+        arp_announcement.write(offset, eth_header).unwrap();
+        arp_announcement.write(offset, arp_header).unwrap();
+
+        node.iff.device.write_packet(&arp_announcement);
+    }
+
+    #[allow(dead_code)]
+    pub fn make_active_arp(node: &mut Node) {
+        issue_arp_request(node, Ipv4Addr::new(192, 168, 0, 105));
+        issue_arp_probe(node, Ipv4Addr::new(192, 168, 0, 105));
+        issue_arp_announcement(node);
+        issue_arp_announcement_reply(node);
     }
 }
 
 fn main() {
     let mut node = nsr::Node::new();
+    //nsr::make_active_arp(&mut node);
     node.handle();
 }
