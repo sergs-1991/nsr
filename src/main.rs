@@ -1,7 +1,9 @@
 mod nsr {
     use std::net::Ipv4Addr;
     use mac_address::MacAddress;
-    use byte::{BytesExt};
+    use byte::BytesExt;
+
+    use self::ip::{icmp::{ICMPHeader, ICMPPacket}, IPHeader, IPPacket};
 
     const DEVICE_NAME: &str = "tap0";
     const IPADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 3, 1);
@@ -14,10 +16,18 @@ mod nsr {
         use mac_address::MacAddress;
         use std::fmt;
 
+        const ETHERNET_HEADER_SIZE: usize = 14;
+
         pub struct EthernetHeader {
             pub mac_dest: MacAddress,
             pub mac_src: MacAddress,
             pub ether_type: u16 //TODO: add enum type
+        }
+
+        impl EthernetHeader {
+            pub fn len(&self) -> usize {
+                ETHERNET_HEADER_SIZE
+            }
         }
 
         impl TryRead<'_> for EthernetHeader {
@@ -30,7 +40,7 @@ mod nsr {
                     ether_type: bytes.read_with::<u16>(offset, BE).unwrap()
                 };
 
-                Ok((header, 14))
+                Ok((header, *offset))
             }
         }
 
@@ -38,9 +48,9 @@ mod nsr {
             fn try_write(self, bytes: &mut [u8], _ctx: ()) -> byte::Result<usize> {
                 let offset = &mut 0;
 
-                bytes.write_with::<&[u8]>(offset, &self.mac_dest.bytes(), ()).unwrap();
-                bytes.write_with::<&[u8]>(offset, &self.mac_src.bytes(), ()).unwrap();
-                bytes.write_with::<u16>(offset, self.ether_type, BE).unwrap();
+                bytes.write::<&[u8]>(offset, &self.mac_dest.bytes()).unwrap();
+                bytes.write::<&[u8]>(offset, &self.mac_src.bytes()).unwrap();
+                bytes.write_with(offset, self.ether_type, BE).unwrap();
 
                 Ok(*offset)
             }
@@ -48,7 +58,7 @@ mod nsr {
 
         impl fmt::Display for EthernetHeader {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "ethernet header:\n\tmac dest: {}\n\tmac src: {}\n\tether_type: 0x{:x}", self.mac_dest, self.mac_src, self.ether_type)
+                write!(f, "ethernet header:\n\tmac dest: {}\n\tmac src: {}\n\tether_type: {:#06x}", self.mac_dest, self.mac_src, self.ether_type)
             }
         }
     }
@@ -86,7 +96,7 @@ mod nsr {
                     tpa: Ipv4Addr::from(bytes.read_with::<u32>(offset, BE).unwrap()),
                 };
 
-                Ok((header, 28))
+                Ok((header, *offset))
             } 
         }
 
@@ -99,9 +109,9 @@ mod nsr {
                 bytes.write(offset, self.hlen).unwrap();
                 bytes.write(offset, self.plen).unwrap();
                 bytes.write_with(offset, self.oper, BE).unwrap();     
-                bytes.write_with::<&[u8]>(offset, &self.sha.bytes(), ()).unwrap();
+                bytes.write::<&[u8]>(offset, &self.sha.bytes()).unwrap();
                 bytes.write_with::<u32>(offset, self.spa.into(), BE).unwrap();
-                bytes.write_with::<&[u8]>(offset, &self.tha.bytes(), ()).unwrap();
+                bytes.write::<&[u8]>(offset, &self.tha.bytes()).unwrap();
                 bytes.write_with::<u32>(offset, self.tpa.into(), BE).unwrap();
 
                 Ok(*offset)
@@ -110,8 +120,8 @@ mod nsr {
 
         impl fmt::Display for ARPHeader {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "arp header:\n\thtype: 0x{:x}\n\tptype: 0x{:x}\n\thlen: 0x{:x}\n\t\
-                plen: 0x{:x}\n\toper: 0x{:x}\n\tsha: {}\n\tspa: {}\n\ttha: {}\n\ttpa: {}",
+                write!(f, "arp header:\n\thtype: {:#06x}\n\tptype: {:#06x}\n\thlen: {:#04x}\n\t\
+                plen: {:#04x}\n\toper: {:#06x}\n\tsha: {}\n\tspa: {}\n\ttha: {}\n\ttpa: {}",
                 self.htype, self.ptype, self.hlen, self.plen, self.oper, self.sha, self.spa, self.tha, self.tpa)
             }
         }
@@ -169,8 +179,7 @@ mod nsr {
             pub fn update(&mut self, ip4: Ipv4Addr, mac: MacAddress) {
                 self.cache.insert(ip4, mac);
             }
-    
-            #[allow(dead_code)]
+
             pub fn get_mac_addr(&self, ip4: &Ipv4Addr) -> Option<MacAddress> {
                 self.cache.get(ip4).copied()
             }
@@ -181,6 +190,363 @@ mod nsr {
                 write!(f, "arp cache: {:?}", self.cache)
             }
         }
+    }
+
+    //TODO: generate IP header identifier
+    //TODO: manage ttl for nodes implementing a router role 
+    //TODO: Explicit Congestion Notification
+    //TODO: IP fragmentation
+    //TODO: IP options
+    //TODO: constrain fields' values which actual size is less then variable size (e.g. ihl is a 4-bit field,
+    //      but represented as 8bit variable) 
+    mod ip {
+        use byte::{BE, BytesExt, TryRead, TryWrite, ctx::Bytes};
+        use internet_checksum::checksum;
+        use std::{fmt, net::Ipv4Addr};
+
+        pub struct IPPacket {
+            header: IPHeader,
+            data: Vec<u8>
+        }
+
+        impl IPPacket {
+            pub fn new(header: IPHeader, data: Vec<u8>) -> Self {
+                let mut packet = Self {
+                    header,
+                    data
+                };
+
+                packet.header.total_length = packet.len() as u16;
+                packet.header.recalc_checksum();
+
+                packet
+            }
+
+            pub fn len(&self) -> usize {
+                self.header.ihl as usize * 4 + self.data.len()
+            }
+
+            pub fn get_header(&self) -> &IPHeader {
+                &self.header
+            }
+
+            pub fn get_data(&self) -> &Vec<u8> {
+                &self.data
+            }
+        }
+
+        impl TryRead<'_> for IPPacket {
+            fn try_read(bytes: &[u8], _ctx: ()) -> byte::Result<(Self, usize)> {
+                let offset = &mut 0;
+
+                let mut packet = IPPacket {
+                    header: bytes.read(offset).unwrap(),
+                    data: vec![],
+                };
+                let data_size = (packet.header.total_length - packet.header.ihl as u16 * 4) as usize;
+                packet.data = bytes.read_with::<&[u8]>(offset, Bytes::Len(data_size)).unwrap().to_vec();
+
+                Ok((packet, *offset))
+            }
+        }
+
+        impl TryWrite for IPPacket {
+            fn try_write(self, bytes: &mut [u8], _ctx: ()) -> byte::Result<usize> {
+                let offset = &mut 0;
+
+                bytes.write(offset, self.header).unwrap();
+                bytes.write::<&[u8]>(offset, self.data.as_ref()).unwrap();
+
+                Ok(*offset)
+            }
+        }
+
+        impl fmt::Display for IPPacket {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                //write!(f, "{}\n\t{:?}", self.header, self.data)
+                write!(f, "{}\n...", self.header)
+            }
+        }
+
+        #[derive(Clone)]
+        pub struct IPHeader {
+            version: u8,
+            ihl: u8,
+            dscp: u8,
+            ecn: u8,
+            total_length: u16,
+            identification: u16,
+            flags: u8,
+            fragment_offset: u16,
+            ttl: u8,
+            pub protocol: u8,
+            checksum: u16,
+            pub source_address: Ipv4Addr,
+            pub destination_address: Ipv4Addr
+        }
+
+        impl IPHeader {
+            pub fn new(source_address: Ipv4Addr, destination_address: Ipv4Addr, protocol: u8) -> Self {
+                Self {
+                    version: 0x04,
+                    ihl: 5,
+                    dscp: 0,
+                    ecn: 0,
+                    total_length: 0,
+                    identification: rand::random(),
+                    flags: 0x02,
+                    fragment_offset: 0,
+                    ttl: 255,
+                    protocol,
+                    checksum: 0,
+                    source_address,
+                    destination_address
+                }
+            }
+
+            fn fragmented(&self) -> bool {
+                self.flags == 0x01 || self.fragment_offset != 0
+            }
+
+            fn recalc_checksum(&mut self) {
+                self.checksum = self.calc_checksum();
+            }
+
+            fn check_checksum(&self) -> bool {
+                self.calc_checksum() == self.checksum
+            }
+
+            fn calc_checksum(&self) -> u16 {
+                let mut layout = [0u8; 20];
+                let mut header = self.clone();
+
+                header.checksum = 0;
+                layout.write(&mut 0, header).unwrap();
+                checksum(&layout).read_with::<u16>(&mut 0, BE).unwrap()
+            }
+        }
+
+        impl TryRead<'_> for IPHeader {
+            fn try_read(bytes: &[u8], _ctx: ()) -> byte::Result<(Self, usize)> {
+                let offset = &mut 0;
+
+                let ver_ihl = bytes.read::<u8>(offset).unwrap();
+                let dscp_ecn = bytes.read::<u8>(offset).unwrap();
+                let total_lenght = bytes.read_with::<u16>(offset, BE).unwrap();
+                let identification = bytes.read_with::<u16>(offset, BE).unwrap();
+                let flags_fragment_offset = bytes.read_with::<u16>(offset, BE).unwrap();
+
+                let header = IPHeader{
+                    version: ver_ihl >> 4,
+                    ihl: ver_ihl & 0x0F,
+                    dscp: dscp_ecn >> 2,
+                    ecn: dscp_ecn & 0x03,
+                    total_length: total_lenght,
+                    identification: identification,
+                    flags: (flags_fragment_offset >> 13) as u8,
+                    fragment_offset: flags_fragment_offset & 0x1FFF,
+                    ttl: bytes.read::<u8>(offset).unwrap(),
+                    protocol: bytes.read::<u8>(offset).unwrap(),
+                    checksum: bytes.read_with::<u16>(offset, BE).unwrap(),
+                    source_address: Ipv4Addr::from(bytes.read_with::<u32>(offset, BE).unwrap()),
+                    destination_address: Ipv4Addr::from(bytes.read_with::<u32>(offset, BE).unwrap())
+                };
+
+                if !header.check_checksum() {
+                    println!("IP header checksum incorrect");
+                    return Err(byte::Error::BadInput{err: "IP header checksum incorrect"})
+                }
+
+                if header.fragmented() {
+                    println!("IP fragmentation is not supported");
+                    return Err(byte::Error::BadInput{err: "IP fragmentation is not supported"})
+                }
+
+                Ok((header, *offset))
+            }
+        }
+
+        impl TryWrite for IPHeader {
+            fn try_write(self, bytes: &mut [u8], _ctx: ()) -> byte::Result<usize> {
+                let offset = &mut 0;
+
+                bytes.write(offset, (self.version << 4) | self.ihl).unwrap();
+                bytes.write(offset, (self.dscp << 2) | self.ecn).unwrap();
+                bytes.write_with(offset, self.total_length, BE).unwrap();
+                bytes.write_with(offset, self.identification, BE).unwrap();
+                bytes.write_with(offset, ((self.flags as u16) << 13) | self.fragment_offset, BE).unwrap();
+                bytes.write(offset, self.ttl).unwrap();
+                bytes.write(offset, self.protocol).unwrap();
+                bytes.write_with(offset, self.checksum, BE).unwrap();
+                bytes.write_with::<u32>(offset, self.source_address.into(), BE).unwrap();
+                bytes.write_with::<u32>(offset, self.destination_address.into(), BE).unwrap();
+
+                Ok(*offset)
+            }
+        }
+
+        impl fmt::Display for IPHeader {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "ip header:\n\tversion: {}\n\tihl: {}\n\tdscp: {}\n\tecn: {}\n\t\
+                total_length: {}\n\tidentification: {}\n\tflags: 0x{:x}\n\tfragment_offset: {}\n\tttl: {}\
+                \n\tprotocol: {:#04x}, \n\tchecksum: {:#06x}, \n\tsource_address: {}, \n\tdestination_address: {}",
+                self.version, self.ihl, self.dscp, self.ecn, self.total_length, self.identification, self.flags,
+                self.fragment_offset, self.ttl, self.protocol, self.checksum, self.source_address,
+                self.destination_address)
+            }
+        }
+
+        pub mod icmp {
+            use byte::{BE, BytesExt, TryRead, TryWrite, ctx::Bytes};
+            use internet_checksum::checksum;
+            use std::fmt;
+
+            const ICMP_HEADER_SIZE: usize = 8;
+
+            pub const ICMP_ECHO_REPLY: u8 = 0;
+            pub const ICMP_ECHO_REQUEST: u8 = 8;
+
+            pub struct ICMPPacket {
+                header: ICMPHeader,
+                data: Vec<u8>
+            }
+
+            impl ICMPPacket {
+                pub fn new(header: ICMPHeader, data: Vec<u8>) -> Self {
+                    let mut packet = Self {
+                        header,
+                        data
+                    };
+                    packet.recalc_checksum();
+
+                    packet
+                }
+
+                pub fn len(&self) -> usize {
+                    ICMP_HEADER_SIZE + self.data.len()
+                }
+
+                pub fn get_header(&self) -> &ICMPHeader {
+                    &self.header
+                }
+
+                pub fn get_data(&self) -> &Vec<u8> {
+                    &self.data
+                }
+
+                fn recalc_checksum(&mut self) {
+                    self.header.checksum = self.calc_checksum();
+                }
+
+                fn check_checksum(&self) -> bool {
+                    self.calc_checksum() == self.header.checksum
+                }
+
+                fn calc_checksum(&self) -> u16 {
+                    let mut layout = vec![0u8; ICMP_HEADER_SIZE + self.data.len()];
+                    let mut header = self.header.clone();
+                    let offset = &mut 0;
+                    header.checksum = 0;
+
+                    // we can serialize copy of packet directry but this aproach will require an additional
+                    // copying of packet's data
+                    layout.as_mut_slice().write(offset, header).unwrap();
+                    layout.as_mut_slice().write::<&[u8]>(offset, self.data.as_ref()).unwrap();
+                    checksum(&layout).read_with::<u16>(&mut 0, BE).unwrap()
+                }
+            }
+
+            impl TryRead<'_> for ICMPPacket {
+                fn try_read(bytes: &[u8], _ctx: ()) -> byte::Result<(Self, usize)> {
+                    let offset = &mut 0;
+
+                    let packet = ICMPPacket{
+                        header: bytes.read(offset).unwrap(),
+                        data: bytes.read_with::<&[u8]>(offset, Bytes::Len(bytes.len() - *offset)).unwrap().to_vec(),
+                    };
+
+                    if !packet.check_checksum() {
+                        println!("ICMP header checksum incorrect");
+                        return Err(byte::Error::BadInput{err: "ICMP header checksum incorrect"})
+                    }
+
+                    Ok((packet, *offset))
+                } 
+            }
+
+            impl TryWrite for ICMPPacket {
+                fn try_write(self, bytes: &mut [u8], _ctx: ()) -> byte::Result<usize> {
+                    let offset = &mut 0;
+
+                    bytes.write(offset, self.header).unwrap();
+                    bytes.write::<&[u8]>(offset, self.data.as_ref()).unwrap();
+
+                    Ok(*offset)
+                }
+            }
+
+            impl fmt::Display for ICMPPacket {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    //write!(f, "{}\n\t{:?}", self.header, self.data)
+                    write!(f, "{}\n...", self.header)
+                }
+            }
+
+            #[derive(Clone)]
+            pub struct ICMPHeader {
+                pub type_: u8,
+                pub code: u8,
+                checksum: u16,
+                pub rest: [u8; 4]
+            }
+
+            impl ICMPHeader {
+                pub fn new(type_: u8, code: u8, rest: [u8; 4]) -> Self {
+                    ICMPHeader {
+                        type_,
+                        code,
+                        checksum: 0,
+                        rest
+                    }
+                }
+            }
+
+            impl TryRead<'_> for ICMPHeader {
+                fn try_read(bytes: &[u8], _ctx: ()) -> byte::Result<(Self, usize)> {
+                    let offset = &mut 0;
+            
+                    let header = ICMPHeader{
+                        type_: bytes.read(offset).unwrap(),
+                        code: bytes.read(offset).unwrap(),
+                        checksum: bytes.read_with(offset, BE).unwrap(),
+                        rest: (bytes.read_with::<&[u8]>(offset, Bytes::Len(4)).unwrap()).try_into().unwrap()
+                    };
+
+                    Ok((header, *offset))
+                } 
+            }
+
+            impl TryWrite for ICMPHeader {
+                fn try_write(self, bytes: &mut [u8], _ctx: ()) -> byte::Result<usize> {
+                    let offset = &mut 0;
+
+                    bytes.write(offset, self.type_).unwrap();
+                    bytes.write(offset, self.code).unwrap();
+                    bytes.write_with(offset, self.checksum, BE).unwrap();   
+                    bytes.write::<&[u8]>(offset, &self.rest).unwrap();
+
+                    Ok(*offset)
+                }
+            }
+
+            impl fmt::Display for ICMPHeader {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "icmp header:\n\ttype: {}\n\tcode: {}\n\tchecksum: {:#06x}\n\trest: {:?}",
+                    self.type_, self.code, self.checksum, self.rest)
+                }
+            }
+        }
+
     }
 
     mod tap {
@@ -251,10 +617,10 @@ mod nsr {
                 ioctl_write_int!(ioctl_set_iff, TUN_IOC_MAGIC, TUN_IOC_SET_IFF);
         
                 unsafe {
-                    println!("Trying to setup tap interface...");
+                    println!("Trying to connect to tap interface...");
         
                     ioctl_set_iff(file.as_raw_fd(), mem::transmute::<&Ifreq, u64>(&ifreq)).expect("failed to setup tap interface");
-                    println!("Tap interface has been setup" );
+                    println!("Connection to tap interface has been established" );
                 };
         
                 TapInterface{file: file}
@@ -329,10 +695,10 @@ mod nsr {
         println!("{eth_header}");
 
         if eth_header.ether_type == 0x0806 {
-            parse_arp_frame(node, &packet[14..]);
+            parse_arp_packet(node, &packet[14..]);
         }
         else if eth_header.ether_type == 0x0800 { //IPv4
-            println!("IPv4 packet")
+            parse_ip_packet(node, &packet[14..]);
         }
         else if eth_header.ether_type == 0x86DD { //IPv6
             println!("IPv6 packet")
@@ -344,7 +710,76 @@ mod nsr {
         println!("");
     }
 
-    fn parse_arp_frame(node: &mut Node, packet: &[u8]) {
+    fn parse_ip_packet(node: &mut Node, data: &[u8]) {
+        let packet: ip::IPPacket = data.read(&mut 0).unwrap();
+        println!("{packet}");
+
+        if packet.get_header().protocol == 0x01 {
+            parse_icmp_packet(node, packet.get_data().as_ref());
+        }
+        if packet.get_header().protocol == 0x06 {
+            println!("TCP datagram");
+        }
+        if packet.get_header().protocol == 0x11 {
+            println!("UDP datagram");
+        }
+    }
+
+    fn parse_icmp_packet(node: &mut Node, data: &[u8]) {
+        use ip::icmp;
+
+        let packet: ICMPPacket = data.read(&mut 0).unwrap();
+        println!("{packet}");
+
+        match packet.get_header().type_ {
+            icmp::ICMP_ECHO_REQUEST => {
+                parse_icmp_echo_request(node, &packet);
+            }
+            _ => {
+                println!("unsupported type of icmp packet");
+                ()
+            }
+        }
+    }
+
+    fn parse_icmp_echo_request(node: &mut Node, icmp_request: &ICMPPacket) {
+        let dest_ip = Ipv4Addr::new(10, 0, 3, 0);
+        let dest_mac = match node.arp_cache.get_mac_addr(&dest_ip) {
+            Some(mac) => mac,
+            None => {
+                issue_arp_request(node, dest_ip);
+                MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+            }
+        };
+
+        let icmp_protocol: u8 = 0x01;
+
+        let icmp_packet = ICMPPacket::new(
+            ICMPHeader::new(ip::icmp::ICMP_ECHO_REPLY, 0, icmp_request.get_header().rest.clone()),
+            icmp_request.get_data().clone());
+        let mut icmp_layout = vec![0u8; icmp_packet.len()];
+        icmp_layout.write(&mut 0, icmp_packet).unwrap();
+
+        let ip_packet = IPPacket::new(IPHeader::new(
+            node.iff.ip4, dest_ip, icmp_protocol),
+            icmp_layout);
+
+        let eth_header = ethernet::EthernetHeader {
+            mac_dest: dest_mac,
+            mac_src: node.iff.mac,
+            ether_type: 0x0800
+        };
+
+        let mut reply = vec![0u8; eth_header.len() + ip_packet.len()];
+        let offset = &mut 0;
+
+        reply.write(offset, eth_header).unwrap();
+        reply.write(offset, ip_packet).unwrap();
+
+        node.iff.device.write_packet(&reply);
+    }
+
+    fn parse_arp_packet(node: &mut Node, packet: &[u8]) {
         let mut arp_header: arp::ARPHeader = packet.read(&mut 0).unwrap();
         println!("{arp_header}");
 
